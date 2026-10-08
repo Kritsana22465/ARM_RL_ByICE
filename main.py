@@ -1,23 +1,23 @@
 import math
-from pathlib import Path
 import tkinter as tk
 from tkinter import ttk
 
 import numpy as np
 import tensorflow as tf
 
-
-MODEL_PATH = Path(__file__).with_name("arm_rl_model.keras")
-ACTION_NAMES = (
-    "หมุนฐาน +",
-    "หมุนฐาน -",
-    "ขยับข้อศอก +",
-    "ขยับข้อศอก -",
-    "หยิบวัตถุ",
-    "วางวัตถุ",
+from model import (
+    CONTROL_NAMES,
+    MAX_STEPS,
+    MODEL_PATH,
+    STATE_DIM,
+    THETA1_LIMITS,
+    THETA2_LIMITS,
+    approach_angle,
+    get_end_effector,
+    make_state,
+    predict_control,
 )
 TICK_MS = 50
-MAX_STEPS = 150
 
 
 class ArmPickPlaceApp:
@@ -40,21 +40,25 @@ class ArmPickPlaceApp:
         self.obj_x, self.obj_y = 270.0, 310.0
         self.tray_x, self.tray_y = 535.0, 310.0
         self.is_holding = False
+        self.has_picked = False
         self.is_running = False
         self.steps = 0
         self.drag_item = None
         self.drag_x = 0
         self.drag_y = 0
         self.last_action = "รอเริ่มทำงาน"
-        self.last_q_values = np.zeros(6, dtype=np.float32)
+        self.last_controls = np.zeros(4, dtype=np.float32)
 
         self.model = None
         self.model_error = None
         try:
             self.model = tf.keras.models.load_model(MODEL_PATH, compile=False)
-            if self.model.input_shape[-1] != 7 or self.model.output_shape[-1] != 6:
+            if (
+                self.model.input_shape[-1] != STATE_DIM
+                or self.model.output_shape[-1] != 2
+            ):
                 raise ValueError(
-                    "โมเดลต้องรับ input 7 ค่าและคืนค่า action 6 ค่า "
+                    f"โมเดลต้องรับ state {STATE_DIM} ค่าและคืนมุมเป้าหมาย 2 ค่า "
                     f"(พบ {self.model.input_shape} -> {self.model.output_shape})"
                 )
         except Exception as exc:
@@ -94,7 +98,7 @@ class ArmPickPlaceApp:
         ).pack(side=tk.LEFT)
         tk.Label(
             header,
-            text="DQN Q-values · IK ช่วยนำแขนไปหยิบและวาง",
+            text="นโยบายที่ฝึกแล้วควบคุมการหยิบและวาง",
             bg="#111827",
             fg="#94a3b8",
             font=("Segoe UI", 10),
@@ -198,9 +202,9 @@ class ArmPickPlaceApp:
         self.gripper_badge.pack(fill=tk.X, padx=14, pady=(0, 12))
 
         self._separator(side)
-        self._section_title(side, "Q-values · 6 actions")
-        self.q_rows = []
-        for name in ACTION_NAMES:
+        self._section_title(side, "ผลทำนายจากโมเดล")
+        self.control_rows = []
+        for name in CONTROL_NAMES:
             row = tk.Frame(side, bg="#172033")
             row.pack(fill=tk.X, padx=16, pady=3)
             tk.Label(
@@ -212,7 +216,7 @@ class ArmPickPlaceApp:
                 font=("Consolas", 8), anchor=tk.E
             )
             value.pack(side=tk.RIGHT)
-            self.q_rows.append(value)
+            self.control_rows.append(value)
 
         self.status_bar = tk.Label(
             self.root,
@@ -291,17 +295,9 @@ class ArmPickPlaceApp:
         return label
 
     def _joint_positions(self):
-        angle1 = math.radians(self.theta1)
-        angle2 = math.radians(self.theta1 + self.theta2)
-        elbow = (
-            self.base_x + self.link1 * math.cos(angle1),
-            self.base_y - self.link1 * math.sin(angle1),
+        return get_end_effector(
+            self.theta1, self.theta2, self.base_x, self.base_y
         )
-        end_effector = (
-            elbow[0] + self.link2 * math.cos(angle2),
-            elbow[1] - self.link2 * math.sin(angle2),
-        )
-        return elbow, end_effector
 
     def _draw_scene(self):
         self.canvas.delete("all")
@@ -395,62 +391,28 @@ class ArmPickPlaceApp:
             bg="#14532d" if self.is_holding else "#29364b",
             fg="#bbf7d0" if self.is_holding else "#e2e8f0",
         )
-        for label, value in zip(self.q_rows, self.last_q_values):
-            label.config(text=f"{value:.2f}")
+        control_text = (
+            f"{self.last_controls[0]:.1f}°",
+            f"{self.last_controls[1]:.1f}°",
+            f"{self.last_controls[2]:.0%}",
+            f"{self.last_controls[3]:.0%}",
+        )
+        for label, value in zip(self.control_rows, control_text):
+            label.config(text=value)
 
     def _get_state(self):
-        return np.asarray(
-            [
-                self.theta1 / 180.0,
-                self.theta2 / 180.0,
-                (self.obj_x - self.base_x) / 400.0,
-                (self.obj_y - self.base_y) / 400.0,
-                (self.tray_x - self.base_x) / 400.0,
-                (self.tray_y - self.base_y) / 400.0,
-                1.0 if self.is_holding else 0.0,
-            ],
-            dtype=np.float32,
-        ).reshape(1, 7)
-
-    def _solve_ik(self, target_x, target_y):
-        dx = target_x - self.base_x
-        dy = self.base_y - target_y
-        distance_squared = dx * dx + dy * dy
-        min_reach = abs(self.link1 - self.link2)
-        max_reach = self.link1 + self.link2
-        if not min_reach**2 <= distance_squared <= max_reach**2:
-            return None
-
-        cos_theta2 = (
-            distance_squared - self.link1**2 - self.link2**2
-        ) / (2 * self.link1 * self.link2)
-        cos_theta2 = min(1.0, max(-1.0, cos_theta2))
-        candidates = []
-        for sin_sign in (-1.0, 1.0):
-            theta2 = math.atan2(
-                sin_sign * math.sqrt(max(0.0, 1.0 - cos_theta2**2)),
-                cos_theta2,
-            )
-            theta1 = math.atan2(dy, dx) - math.atan2(
-                self.link2 * math.sin(theta2),
-                self.link1 + self.link2 * math.cos(theta2),
-            )
-            angles = (math.degrees(theta1), math.degrees(theta2))
-            if -90.0 <= angles[0] <= 180.0 and -150.0 <= angles[1] <= 150.0:
-                cost = abs(angles[0] - self.theta1) + abs(
-                    angles[1] - self.theta2
-                )
-                candidates.append((cost, angles))
-        if not candidates:
-            return None
-        return min(candidates, key=lambda candidate: candidate[0])[1]
-
-    @staticmethod
-    def _approach_angle(current, target, step):
-        difference = target - current
-        if abs(difference) <= step:
-            return target
-        return current + math.copysign(step, difference)
+        return make_state(
+            self.theta1,
+            self.theta2,
+            self.obj_x,
+            self.obj_y,
+            self.tray_x,
+            self.tray_y,
+            self.is_holding,
+            self.has_picked,
+            self.base_x,
+            self.base_y,
+        ).reshape(1, STATE_DIM)
 
     def start_simulation(self):
         if self.model is None:
@@ -461,7 +423,7 @@ class ArmPickPlaceApp:
         self.is_running = True
         self.steps = 0
         self.start_button.config(state=tk.DISABLED)
-        self._set_status("โมเดลประเมิน Q-values · ระบบคำนวณมุม IK เพื่อหยิบและวาง")
+        self._set_status("โมเดลกำลังควบคุมการเคลื่อนที่และคำสั่งจับ/ปล่อย")
         self.root.after(TICK_MS, self._simulation_step)
 
     def stop_simulation(self):
@@ -473,70 +435,51 @@ class ArmPickPlaceApp:
         if not self.is_running:
             return
         try:
-            q_values = np.asarray(
-                self.model(self._get_state(), training=False).numpy()[0],
+            theta1_target, theta2_target, grip_confidence, finish_confidence = (
+                predict_control(self.model, self._get_state())
+            )
+            controls = np.asarray(
+                [theta1_target, theta2_target, grip_confidence, finish_confidence],
                 dtype=np.float32,
             )
-            if q_values.shape != (6,) or not np.isfinite(q_values).all():
-                raise ValueError(f"โมเดลคืนค่า Q-values ไม่ถูกต้อง: {q_values}")
+            if not np.isfinite(controls).all():
+                raise ValueError(
+                    f"โมเดลคืนค่าควบคุมไม่ถูกต้อง: {controls}"
+                )
         except Exception as exc:
             self.is_running = False
             self.start_button.config(state=tk.NORMAL)
             self._set_status(f"เกิดข้อผิดพลาดขณะเรียกโมเดล: {exc}", error=True)
             return
 
-        rl_action = int(np.argmax(q_values))
-        self.last_q_values = q_values
-        target_x, target_y = (
-            (self.tray_x, self.tray_y)
-            if self.is_holding
-            else (self.obj_x, self.obj_y)
-        )
-        target_angles = self._solve_ik(target_x, target_y)
-        if target_angles is None:
-            target_name = "ถาด" if self.is_holding else "วัตถุ"
-            self.is_running = False
-            self.start_button.config(state=tk.NORMAL)
-            self._set_status(
-                f"{target_name} อยู่นอกระยะเอื้อมหรือขอบเขตข้อต่อ "
-                "โปรดลากให้อยู่ในระยะของแขนกล",
-                error=True,
-            )
-            return
-
-        phase = "กำลังไปวาง" if self.is_holding else "กำลังไปหยิบ"
-        self.last_action = f"{phase} · RL: {ACTION_NAMES[rl_action]}"
+        self.last_controls = controls
         self.steps += 1
-        angle_step = 3.0
-        self.theta1 = self._approach_angle(
-            self.theta1, target_angles[0], angle_step
+        self.theta1 = approach_angle(
+            self.theta1, theta1_target, THETA1_LIMITS
         )
-        self.theta2 = self._approach_angle(
-            self.theta2, target_angles[1], angle_step
+        self.theta2 = approach_angle(
+            self.theta2, theta2_target, THETA2_LIMITS
         )
 
         _, end_effector = self._joint_positions()
-        dist_to_object = math.hypot(
-            end_effector[0] - self.obj_x, end_effector[1] - self.obj_y
-        )
-        placed = False
+        grip_command = grip_confidence >= 0.5
         if self.is_holding:
             self.obj_x, self.obj_y = end_effector
-            if math.hypot(
-                end_effector[0] - self.tray_x, end_effector[1] - self.tray_y
-            ) < 18:
+            if grip_command:
                 self.is_holding = False
-                placed = math.hypot(
-                    self.obj_x - self.tray_x, self.obj_y - self.tray_y
-                ) < 35
-                self.last_action = f"วางวัตถุแล้ว · RL: {ACTION_NAMES[rl_action]}"
-        elif dist_to_object < 18:
+                self.last_action = "วางวัตถุแล้ว"
+            else:
+                self.last_action = "กำลังนำวัตถุไปวาง"
+        elif grip_command:
             self.is_holding = True
+            self.has_picked = True
             self.obj_x, self.obj_y = end_effector
-            self.last_action = f"หยิบวัตถุแล้ว · RL: {ACTION_NAMES[rl_action]}"
+            self.last_action = "หยิบวัตถุแล้ว"
+        else:
+            self.last_action = "โมเดลกำลังขยับแขน"
 
         self._draw_scene()
-        if placed:
+        if finish_confidence >= 0.5:
             self.is_running = False
             self.start_button.config(state=tk.NORMAL)
             self._set_status(f"สำเร็จ! วางวัตถุบนถาดแล้ว · {self.steps} ขั้น")
@@ -588,8 +531,9 @@ class ArmPickPlaceApp:
         self.obj_x, self.obj_y = 270.0, 310.0
         self.tray_x, self.tray_y = 535.0, 310.0
         self.is_holding = False
+        self.has_picked = False
         self.steps = 0
-        self.last_q_values = np.zeros(6, dtype=np.float32)
+        self.last_controls = np.zeros(4, dtype=np.float32)
         self.last_action = "รอเริ่มทำงาน"
         self._draw_scene()
         self._set_status("คืนตำแหน่งเริ่มต้นแล้ว")
