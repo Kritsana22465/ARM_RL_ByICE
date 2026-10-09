@@ -1,0 +1,3 @@
+numpy
+tensorflow
+stable-baselines3>=2.9.0,<3.0.0
